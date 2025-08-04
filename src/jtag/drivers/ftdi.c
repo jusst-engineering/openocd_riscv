@@ -89,6 +89,10 @@
 #define DO_CLOCK_DATA clock_data
 #define DO_CLOCK_TMS_CS clock_tms_cs
 #define DO_CLOCK_TMS_CS_OUT clock_tms_cs_out
+#elif BUILD_FTDI_LATTICE_HUB == 1
+#define DO_CLOCK_DATA lattice_hub_clock_data
+#define DO_CLOCK_TMS_CS lattice_hub_clock_tms_cs
+#define DO_CLOCK_TMS_CS_OUT lattice_hub_clock_tms_cs_out
 #else
 #define DO_CLOCK_DATA mpsse_clock_data
 #define DO_CLOCK_TMS_CS mpsse_clock_tms_cs
@@ -104,6 +108,134 @@ static uint8_t ftdi_channel;
 static uint8_t ftdi_jtag_mode = JTAG_MODE;
 
 static bool swd_mode;
+static bool cpu_enabled;
+
+#if BUILD_FTDI_LATTICE_HUB == 1
+static void bridge_move_to_state(struct mpsse_ctx *ctx, tap_state_t goal_state)
+{
+	static tap_state_t bridge_tap_state = TAP_IDLE;
+	uint8_t tms_bits = tap_get_tms_path(bridge_tap_state, goal_state);
+	int tms_count = tap_get_tms_path_len(bridge_tap_state, goal_state);
+	assert(tms_count <= 8);
+	mpsse_clock_tms_cs_out(ctx, &tms_bits, 0, tms_count, false, ftdi_jtag_mode);
+	bridge_tap_state = goal_state;
+}
+
+static void lattice_hub_clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
+		uint8_t *in, unsigned in_offset, unsigned length, uint8_t mode) {
+	if (!cpu_enabled) {
+		mpsse_clock_data(ctx, out, out_offset, in, in_offset, length, mode);
+		return;
+	}
+
+	bridge_move_to_state(ctx, TAP_DRSHIFT);
+
+	/* length is in bits, encoding needs 4 bits for each bit, can pack two nibbles into each byte */
+	int encoded_length = (length + 1) / 2;
+	uint8_t *bridge_out = malloc(encoded_length);
+	memset(bridge_out, 0, encoded_length);
+
+	if (out) {
+		for (unsigned i = 0; i < length; i++) {
+			int byte = i / 8; /* byte to read our next bit from */
+			int shift = i % 8; /* which bit in our current byte */
+			int outshift = i % 2 ? 4 : 0; /* write into high or low nibble? */
+			int bit = (out[byte] >> shift) & 0x1; /* extract bit */
+			int nibble = (bit << 1) | 0x01; /* shift up to bit 1, bit 0 is always 1 */
+			bridge_out[i / 2] |= (nibble << outshift);
+		}
+	} else {
+		memset(bridge_out, 0x33, encoded_length);
+	}
+
+	uint8_t *bridge_in = NULL;
+	if (in) {
+		bridge_in = malloc(encoded_length);
+		memset(bridge_in, 0, encoded_length);
+	}
+
+	mpsse_clock_data(ctx, bridge_out, 0, bridge_in, 0, encoded_length * 8, mode);
+	mpsse_flush(ctx);
+
+	if (in) {
+		int shift = 0;
+		int n = 0;
+		in[in_offset] = 0;
+		for (int i = 0; i < encoded_length; i++) {
+			int hbit = (bridge_in[i] >> 7) & 0x1;
+			int lbit = (bridge_in[i] >> 3) & 0x1;
+
+			in[in_offset + n] |= (lbit << shift);
+			shift++;
+			in[in_offset + n] |= (hbit << shift);
+			shift++;
+			if (shift >= 7) {
+				shift = 0;
+				n++;
+				in[in_offset + n] = 0;
+			}
+		}
+	}
+
+	free(bridge_in);
+	free(bridge_out);
+	bridge_move_to_state(ctx, TAP_IDLE);
+}
+
+static void lattice_hub_clock_tms_cs(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
+		uint8_t *in, unsigned in_offset, unsigned length, bool tdi, uint8_t mode) {
+	if (!cpu_enabled) {
+		mpsse_clock_tms_cs(ctx, out, out_offset, in, in_offset, length, tdi, mode);
+		return;
+	}
+
+	bridge_move_to_state(ctx, TAP_DRSHIFT);
+
+	/* convert tms bits, each bit will go into its own nibble */
+	uint8_t bridge_out[4] = {0};
+	int n = 0;
+	uint8_t tms = *out;
+	for (unsigned i = out_offset; i < length; i++) {
+		int bit = (tms >> i) & 1; /* extract ith bit */
+		int nibble = (bit << 2);  /* tms bits are at bit 2 in a nibble: 0b0X00 */
+		nibble |= 1;			        /* also the low bit is always 1: 0b0X01 */
+		if (i == length - 1 && tdi)
+			nibble |= 0x2;          /* the last nibble has bit 1 set if tdi is true: 0b0X11 */
+
+		/* every second nibble is the high nibble of a byte */
+		if (n % 2 == 1)
+			nibble <<= 4;
+
+		bridge_out[n / 2] |= nibble;
+		n++;
+	}
+
+	uint8_t bridge_in[4] = {0};
+	int bridge_length = length * 4 - 1;
+	LOG_DEBUG("clock(%d)", bridge_length);
+	mpsse_clock_data(ctx, bridge_out, 0, bridge_in, 0, bridge_length, mode);
+	mpsse_flush(ctx);
+
+	if (in) {
+		int shift = 7;
+		for (unsigned i = 0; i < sizeof(bridge_in); i++) {
+			int hbit = (bridge_in[i] >> 7) & 0x1;
+			int lbit = (bridge_in[i] >> 3) & 0x1;
+			in[in_offset] |= (hbit << shift);
+			shift--;
+			in[in_offset] |= (lbit << shift);
+			shift--;
+		}
+	}
+
+	bridge_move_to_state(ctx, TAP_IDLE);
+}
+
+static void lattice_hub_clock_tms_cs_out(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
+		unsigned length, bool tdi, uint8_t mode) {
+	DO_CLOCK_TMS_CS(ctx, out, out_offset, NULL, 0, length, tdi, mode);
+}
+#endif
 
 #if BUILD_FTDI_CJTAG == 1
 #define ESCAPE_SEQ_OAC_BIT2 28
@@ -675,6 +807,12 @@ static void ftdi_execute_stableclocks(struct jtag_command *cmd)
 
 static void ftdi_execute_command(struct jtag_command *cmd)
 {
+	const char *names[] = {
+		"scan", "tlr-reset", "runtest", "reset", "pathmove", "sleep", "stableclocks", "tms"
+	};
+
+	LOG_DEBUG("-----> command: %s", names[cmd->type - 1]);
+	LOG_DEBUG("-----> cpu enabled: %s", cpu_enabled ? "true" : "false");
 	switch (cmd->type) {
 #if BUILD_FTDI_CJTAG == 1
 		case JTAG_RESET:
@@ -734,8 +872,20 @@ static int ftdi_execute_queue(void)
 	return retval;
 }
 
+static int cpu_tap_enable_callback(enum jtag_event event, void *priv)
+{
+	cpu_enabled = false;
+	for (struct jtag_tap *tap = jtag_all_taps(); tap; tap = tap->next_tap) {
+		if (strstr(tap->dotted_name, ".cpu") != NULL)
+			cpu_enabled = tap->enabled;
+	}
+
+	return ERROR_OK;
+}
+
 static int ftdi_initialize(void)
 {
+	LOG_DEBUG("ftdi init");
 	if (tap_get_tms_path_len(TAP_IRPAUSE, TAP_IRPAUSE) == 7)
 		LOG_DEBUG("ftdi interface using 7 step jtag state transitions");
 	else
@@ -792,7 +942,11 @@ static int ftdi_initialize(void)
 
 	freq = mpsse_set_frequency(mpsse_ctx, adapter_get_speed_khz() * 1000);
 
-	return mpsse_flush(mpsse_ctx);
+	int ret = mpsse_flush(mpsse_ctx);
+
+	jtag_register_event_callback(cpu_tap_enable_callback, NULL);
+
+	return ret;
 }
 
 static int ftdi_quit(void)
