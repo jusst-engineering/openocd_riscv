@@ -2100,7 +2100,7 @@ static int vexriscv_examine(struct target *target)
 		}
 
 		// Patch to extract litex_server info out of socket
-		flush_network_socket(target);
+		if (vexriscv->useTCP) flush_network_socket(target);
 
 		uint32_t halted;
 		int retval = vexriscv_is_halted(target,&halted);
